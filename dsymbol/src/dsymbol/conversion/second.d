@@ -545,9 +545,238 @@ void resolveType(DSymbol* symbol, ref TypeLookups typeLookups,
 		// issue 94
 		else if (lookup.kind == TypeLookupKind.inherit)
 			resolveInheritance(symbol, typeLookups, moduleScope, cache);
+		else if (lookup.kind == TypeLookupKind.templateInstantiation)
+			resolveTemplateInstantiation(symbol, lookup, moduleScope, cache);
 		else
 			assert(false, "How did this happen?");
 		}
+}
+
+void resolveTemplateInstantiation(DSymbol* symbol, TypeLookup* lookup,
+	Scope* moduleScope, ref ModuleCache cache)
+{
+	if (moduleScope is null)
+		return;
+
+	// Get the template name from breadcrumbs
+	if (lookup.breadcrumbs.empty)
+		return;
+
+	istring templateName = lookup.breadcrumbs.back;
+	DSymbol*[] templateSymbols = moduleScope.getSymbolsByNameAndCursor(templateName, symbol.location);
+	if (templateSymbols.length == 0)
+	{
+		symbol.typeSymbolName = templateName;
+		return;
+	}
+
+	DSymbol* templateSymbol = templateSymbols[0];
+
+	// Ensure we found a template
+	if (templateSymbol.kind != CompletionKind.templateName
+		&& templateSymbol.kind != CompletionKind.structName
+		&& templateSymbol.kind != CompletionKind.className
+		&& templateSymbol.kind != CompletionKind.unionName
+		&& templateSymbol.qualifier != SymbolQualifier.templated)
+	{
+		symbol.type = templateSymbol;
+		symbol.ownType = false;
+		return;
+	}
+
+	// Create a new DSymbol for the instantiated type
+	// This symbol will have its template parameters resolved
+	auto instantiatedType = GCAllocator.instance.make!DSymbol(
+		templateSymbol.name,
+		templateSymbol.kind == CompletionKind.templateName
+			? CompletionKind.structName : templateSymbol.kind);
+	instantiatedType.location = symbol.location;
+	instantiatedType.symbolFile = templateSymbol.symbolFile;
+	instantiatedType.qualifier = templateSymbol.qualifier;
+
+	// Get template parameter names from the template declaration
+	import std.array : Appender;
+	auto paramNamesAppender = Appender!(istring[])();
+	foreach (child; templateSymbol.opSlice())
+	{
+		if (child.kind == CompletionKind.typeTmpParam
+			|| child.kind == CompletionKind.aliasName)
+		{
+			paramNamesAppender.put(child.name);
+		}
+	}
+	istring[] templateParamNames = paramNamesAppender.data;
+
+	// Collect template argument values by iterating through templateArguments
+	// We need to group them because qualified types have multiple breadcrumbs
+	import containers.unrolledlist : UnrolledList;
+	auto argValues = Appender!(DSymbol*[])();
+	DSymbol* currentArgType = null;
+	size_t argIndex = 0;
+	foreach (argPart; lookup.templateArguments[])
+	{
+		if (currentArgType is null)
+		{
+			// Start of a new argument
+			auto symbols = moduleScope.getSymbolsByNameAndCursor(argPart, symbol.location);
+			if (symbols.length > 0)
+				currentArgType = symbols[0];
+		}
+		else
+		{
+			// This is a qualified path continuation (e.g., Inner in Outter.Inner)
+			if (currentArgType !is null)
+			{
+				auto deeperSymbols = currentArgType.getPartsByName(argPart);
+				if (deeperSymbols.length > 0)
+					currentArgType = deeperSymbols[0];
+				else
+					currentArgType = null;
+			}
+		}
+
+		// Check if we have a suffix marker indicating end of an argument
+		if (argPart == ARRAY_SYMBOL_NAME || argPart == POINTER_SYMBOL_NAME
+			|| argPart == ASSOC_ARRAY_SYMBOL_NAME || argPart == FUNCTION_SYMBOL_NAME)
+		{
+			// This is a suffix, not a type part
+			if (currentArgType !is null)
+			{
+				// Apply suffix to the current type
+			}
+			continue;
+		}
+
+		// We'll collect this argument and move to the next
+		// For now, we don't have a good way to detect argument boundaries
+		// So we'll just use a heuristic: when we can't go deeper, this is a complete argument
+	}
+
+	// For now, use a simpler approach: group template arguments sequentially
+	argValues.clear();
+	DSymbol*[istring] substitutionMap;
+	argIndex = 0;
+
+	// Convert templateArguments iterable to array for easier indexing
+	import std.array : array;
+	auto templateArgsArray = array(lookup.templateArguments[]);
+
+	// Resolve template arguments by sequentially processing the breadcrumb list
+	size_t argPartIndex = 0;
+	foreach (i, child; templateSymbol.opSlice())
+	{
+		if (child.kind == CompletionKind.typeTmpParam
+			|| child.kind == CompletionKind.aliasName)
+		{
+			// Resolve template argument for this parameter
+			DSymbol* argType = null;
+			if (argPartIndex < templateArgsArray.length)
+			{
+				// Get the first part of the argument
+				auto argFirstPart = templateArgsArray[argPartIndex];
+				auto symbols = moduleScope.getSymbolsByNameAndCursor(argFirstPart, symbol.location);
+				if (symbols.length > 0)
+				{
+					argType = symbols[0];
+					// Try to follow the qualified path
+					argPartIndex++;
+					while (argPartIndex < templateArgsArray.length)
+					{
+						auto nextPart = templateArgsArray[argPartIndex];
+						// Check if this is a suffix marker or module separator
+						if (nextPart == ARRAY_SYMBOL_NAME
+							|| nextPart == POINTER_SYMBOL_NAME
+							|| nextPart == ASSOC_ARRAY_SYMBOL_NAME
+							|| nextPart == FUNCTION_SYMBOL_NAME
+							|| nextPart == MODULE_SYMBOL_NAME)
+						{
+							argPartIndex++;
+							continue;
+						}
+						// Try to go deeper - look for nextPart in argType's children
+						DSymbol*[] deeperSymbols;
+						// Check if argType has a part with this name
+						foreach (part; argType.getPartsByName(nextPart))
+							deeperSymbols ~= part;
+						// Also check children (for nested types)
+						foreach (nestedChild; argType.opSlice())
+							if (nestedChild.name == nextPart)
+								deeperSymbols ~= nestedChild;
+						if (deeperSymbols.length > 0)
+						{
+							argType = deeperSymbols[0];
+							argPartIndex++;
+						}
+						else
+						{
+							// Can't go deeper, this must be a new argument
+							break;
+						}
+					}
+				}
+			}
+
+			if (argType is null)
+			{
+				// Create a fallback symbol
+				argType = GCAllocator.instance.make!DSymbol(child.name, CompletionKind.structName);
+				argType.symbolFile = templateSymbol.symbolFile;
+			}
+			substitutionMap[child.name] = argType;
+		}
+	}
+
+	// Copy children from template, resolving template parameter types
+	foreach (child; templateSymbol.opSlice())
+	{
+		if (child.kind == CompletionKind.typeTmpParam
+			|| child.kind == CompletionKind.aliasName)
+		{
+			// Skip template parameters themselves, but add their resolved types as members
+			if (child.name in substitutionMap)
+			{
+				auto resolvedChild = GCAllocator.instance.make!DSymbol(
+					substitutionMap[child.name].name,
+					CompletionKind.typeTmpParam,
+					substitutionMap[child.name].type ? substitutionMap[child.name].type : substitutionMap[child.name]);
+				resolvedChild.symbolFile = child.symbolFile;
+				resolvedChild.ownType = false;
+				instantiatedType.addChild(resolvedChild, true);
+			}
+		}
+		else if (child.type !is null && child.type.name in substitutionMap)
+		{
+			// This member's type is a template parameter - resolve it
+			auto resolvedMember = GCAllocator.instance.make!DSymbol(
+				child.name,
+				child.kind,
+				substitutionMap[child.type.name]);
+			resolvedMember.symbolFile = child.symbolFile;
+			resolvedMember.callTip = child.callTip;
+			resolvedMember.doc = child.doc;
+			resolvedMember.protection = child.protection;
+			resolvedMember.qualifier = child.qualifier;
+			instantiatedType.addChild(resolvedMember, true);
+		}
+		else
+		{
+			// Copy other children as-is
+			auto copiedChild = GCAllocator.instance.make!DSymbol(
+				child.name,
+				child.kind,
+				child.type);
+			copiedChild.symbolFile = child.symbolFile;
+			copiedChild.callTip = child.callTip;
+			copiedChild.doc = child.doc;
+			copiedChild.protection = child.protection;
+			copiedChild.qualifier = child.qualifier;
+			copiedChild.ownType = false;
+			instantiatedType.addChild(copiedChild, true);
+		}
+	}
+
+	symbol.type = instantiatedType;
+	symbol.ownType = true;
 }
 
 void typeSwap(ref DSymbol* currentSymbol)
